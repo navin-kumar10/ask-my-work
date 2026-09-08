@@ -9,10 +9,13 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.db import db
+from app.services.qdrant_store import QdrantStore
 from app.services.redaction import redact
+from app.services.text import chunk_text
 
-app = FastAPI(title=settings.app_name, version="0.1.1")
+app = FastAPI(title=settings.app_name, version="0.1.0")
 UI = Path("/app/ui/index.html")
+store = QdrantStore()
 
 
 class Note(BaseModel):
@@ -30,6 +33,18 @@ class Event(BaseModel):
     content: str
 
 
+async def ollama_json(path: str, payload: dict) -> dict:
+    async with httpx.AsyncClient(timeout=180) as client:
+        response = await client.post(f"{settings.ollama_url}{path}", json=payload)
+        response.raise_for_status()
+        return response.json()
+
+
+async def embed(text: str) -> list[float]:
+    data = await ollama_json("/api/embed", {"model": settings.embed_model, "input": text})
+    return data["embeddings"][0]
+
+
 @app.get("/")
 def home():
     return FileResponse(UI)
@@ -42,73 +57,71 @@ def health():
     return {"status": "ok", "app": settings.app_name, "mode": "read-only"}
 
 
-async def ollama_generate(prompt: str):
-    async with httpx.AsyncClient(timeout=180) as client:
-        response = await client.post(
-            f"{settings.ollama_url}/api/generate",
-            json={"model": settings.chat_model, "prompt": prompt, "stream": False},
+async def index_document(document_id: str, title: str, content: str, source: str):
+    chunks = chunk_text(content)
+    points = []
+    for index, chunk in enumerate(chunks):
+        vector = await embed(chunk)
+        points.append({
+            "id": f"{document_id}:{index}",
+            "vector": vector,
+            "payload": {"knowledge_id": document_id, "title": title, "content": chunk, "source": source},
+        })
+    if points:
+        store.ensure(len(points[0]["vector"]))
+        store.upsert(points)
+    with db() as conn:
+        conn.execute("UPDATE knowledge SET indexed_at=%s WHERE id=%s", (datetime.now(timezone.utc), document_id))
+        conn.commit()
+
+
+async def save_knowledge(title: str, content: str, source: str) -> str:
+    knowledge_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO knowledge (id, title, content, source, created_at) VALUES (%s, %s, %s, %s, %s)",
+            (knowledge_id, title, content, source, now),
         )
-        response.raise_for_status()
-        return response.json().get("response", "")
+        conn.commit()
+    await index_document(knowledge_id, title, content, source)
+    return knowledge_id
 
 
 @app.post("/api/v1/notes")
-def create_note(note: Note):
+async def create_note(note: Note):
     content = redact(note.content)
-    now = datetime.now(timezone.utc)
-    note_id = str(uuid.uuid4())
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO knowledge (id, title, content, source, created_at) VALUES (%s, %s, %s, %s, %s)",
-            (note_id, note.title, content, "note", now),
-        )
-        conn.commit()
-    return {"id": note_id, "title": note.title, "source": "note", "created_at": now.isoformat(), "status": "stored"}
+    note_id = await save_knowledge(note.title, content, "note")
+    return {"id": note_id, "title": note.title, "source": "note", "status": "indexed"}
 
 
 @app.post("/api/v1/events")
-def create_event(event: Event):
-    event_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc)
+async def create_event(event: Event):
     content = redact(event.content)
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO knowledge (id, title, content, source, created_at) VALUES (%s, %s, %s, %s, %s)",
-            (event_id, event.title, content, event.source, now),
-        )
-        conn.commit()
-    return {"id": event_id, "status": "stored", "read_only": True}
+    event_id = await save_knowledge(event.title, content, event.source)
+    return {"id": event_id, "status": "indexed", "read_only": True}
 
 
 @app.post("/api/v1/search")
-def search(query: Chat):
-    pattern = f"%{query.question}%"
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT id, title, content, source, created_at FROM knowledge "
-            "WHERE content ILIKE %s OR title ILIKE %s ORDER BY created_at DESC LIMIT %s",
-            (pattern, pattern, settings.top_k),
-        ).fetchall()
-    return {"results": rows}
+async def search(query: Chat):
+    vector = await embed(query.question)
+    points = store.search(vector, settings.top_k)
+    return {"results": [point.payload | {"score": point.score} for point in points]}
 
 
 @app.post("/api/v1/chat")
 async def chat(query: Chat):
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT id, title, content, source, created_at FROM knowledge "
-            "ORDER BY created_at DESC LIMIT %s",
-            (settings.top_k,),
-        ).fetchall()
-
+    vector = await embed(query.question)
+    points = store.search(vector, settings.top_k)
     context = "\n\n".join(
-        f"[{row['source']}] {row['title']}: {row['content']}" for row in rows
+        f"[{p.payload.get('source')}] {p.payload.get('title')}: {p.payload.get('content')}"
+        for p in points
     )
     prompt = (
-        "You are Ask My Work, a local work-memory assistant. "
-        "Answer only from the supplied work evidence. If evidence is insufficient, say so. "
-        "Never invent commands or actions.\n\n"
+        "You are Ask My Work, a local work-memory assistant. Answer only from the supplied evidence. "
+        "If evidence is insufficient, say so. Never invent facts, commands, or actions.\n\n"
         f"Evidence:\n{context}\n\nQuestion: {query.question}"
     )
-    answer = await ollama_generate(prompt)
-    return {"answer": answer, "sources": rows}
+    data = await ollama_json("/api/generate", {"model": settings.chat_model, "prompt": prompt, "stream": False})
+    sources = [p.payload | {"score": p.score} for p in points]
+    return {"answer": data.get("response", ""), "sources": sources}
