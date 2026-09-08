@@ -4,6 +4,7 @@ import uuid
 
 import httpx
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from app.config import settings
