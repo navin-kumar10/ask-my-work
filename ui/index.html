@@ -1,1 +1,112 @@
-<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Ask My Work</title><style>body{font-family:system-ui;max-width:900px;margin:40px auto;padding:0 20px;background:#f7f7f8}main{background:white;padding:28px;border-radius:16px}textarea,input{width:100%;box-sizing:border-box;padding:12px;margin:8px 0;border:1px solid #ddd;border-radius:8px}button{padding:11px 18px;border:0;border-radius:8px;cursor:pointer}.answer{white-space:pre-wrap;margin-top:20px;padding:16px;background:#f1f1f1;border-radius:10px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}@media(max-width:700px){.grid{grid-template-columns:1fr}}</style></head><body><main><h1>Ask My Work</h1><p>Local-first AI work memory · v0.1 · read-only</p><div class='grid'><section><h2>Save a note</h2><input id='title' placeholder='Title'><textarea id='content' rows='7' placeholder='What did you learn or fix?'></textarea><button onclick='note()'>Save Note</button></section><section><h2>Ask</h2><textarea id='q' rows='7' placeholder='How did I fix the Redis problem?'></textarea><button onclick='ask()'>Ask My Work</button><div id='answer' class='answer'></div></section></div></main><script>async function note(){let r=await fetch('/api/v1/notes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:title.value,content:content.value})});alert(r.ok?'Note saved':'Failed');}async function ask(){answer.textContent='Thinking...';let r=await fetch('/api/v1/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q.value})});let d=await r.json();answer.textContent=d.answer||JSON.stringify(d);}</script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Ask My Work</title>
+  <style>
+    body{font-family:system-ui;max-width:1000px;margin:40px auto;padding:0 20px;background:#f7f7f8;color:#202124}
+    main{background:white;padding:28px;border-radius:16px;box-shadow:0 2px 12px #0000000d}
+    textarea,input{width:100%;box-sizing:border-box;padding:12px;margin:8px 0;border:1px solid #ddd;border-radius:8px;font:inherit}
+    button{padding:11px 18px;border:0;border-radius:8px;cursor:pointer;font-weight:600}
+    button:disabled{opacity:.6;cursor:wait}
+    .answer,.sources,.status{white-space:pre-wrap;margin-top:16px;padding:16px;background:#f1f1f1;border-radius:10px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+    .ok{background:#e9f7ef}.error{background:#fff0f0}
+    .source{padding:10px 0;border-bottom:1px solid #ddd}.source:last-child{border-bottom:0}
+    @media(max-width:700px){.grid{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Ask My Work</h1>
+  <p>Local-first AI work memory · V0.1 · read-only</p>
+  <div id="status" class="status">Checking services...</div>
+
+  <div class="grid">
+    <section>
+      <h2>Save a note</h2>
+      <input id="title" placeholder="Title">
+      <textarea id="content" rows="8" placeholder="What did you learn or fix?"></textarea>
+      <button id="saveBtn" onclick="note()">Save Note</button>
+      <div id="noteResult" class="status" hidden></div>
+    </section>
+
+    <section>
+      <h2>Ask</h2>
+      <textarea id="q" rows="8" placeholder="How did I fix the Redis problem?"></textarea>
+      <button id="askBtn" onclick="ask()">Ask My Work</button>
+      <div id="answer" class="answer">Your answer will appear here.</div>
+      <div id="sources" class="sources" hidden></div>
+    </section>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+
+async function api(path, options={}) {
+  const r = await fetch(path, options);
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = {detail:text}; }
+  if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+  return data;
+}
+
+async function checkStatus() {
+  try {
+    const d = await api('/health/dependencies');
+    const good = d.postgres === 'ok' && d.qdrant === 'ok' && d.ollama === 'ok';
+    $('status').className = `status ${good ? 'ok' : 'error'}`;
+    $('status').textContent = `PostgreSQL: ${d.postgres}\nQdrant: ${d.qdrant}\nOllama: ${d.ollama}`;
+  } catch (e) {
+    $('status').className = 'status error';
+    $('status').textContent = `Dependency check failed: ${e.message}`;
+  }
+}
+
+async function note() {
+  const button = $('saveBtn');
+  const result = $('noteResult');
+  button.disabled = true;
+  result.hidden = false;
+  try {
+    const d = await api('/api/v1/notes', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({title:$('title').value, content:$('content').value})
+    });
+    result.className = 'status ok';
+    result.textContent = `Saved and indexed: ${d.title}`;
+    $('content').value = '';
+  } catch (e) {
+    result.className = 'status error';
+    result.textContent = `Save failed: ${e.message}`;
+  } finally { button.disabled = false; }
+}
+
+async function ask() {
+  const button = $('askBtn');
+  button.disabled = true;
+  $('answer').textContent = 'Thinking...';
+  $('sources').hidden = true;
+  try {
+    const d = await api('/api/v1/chat', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({question:$('q').value})
+    });
+    $('answer').textContent = d.answer || 'No answer returned.';
+    if (d.sources?.length) {
+      $('sources').hidden = false;
+      $('sources').textContent = 'Sources\n\n' + d.sources.map((s,i) =>
+        `${i+1}. ${s.title} [${s.source}] (score: ${Number(s.score).toFixed(3)})\n${s.content}`
+      ).join('\n\n');
+    }
+  } catch (e) {
+    $('answer').textContent = `Request failed: ${e.message}`;
+  } finally { button.disabled = false; }
+}
+
+checkStatus();
+</script>
+</body>
+</html>
