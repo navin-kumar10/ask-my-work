@@ -1,69 +1,97 @@
 # Ask My Work
 
-**Local-first AI work-memory agent.**
+Local-first AI work-memory assistant.
 
-Ask My Work turns approved work context into a private, searchable knowledge base. It uses retrieval-augmented generation (RAG), not continuous LLM training.
-
-## v0.1.1 stack
-
-- FastAPI API and web UI
-- **PostgreSQL** for application metadata and knowledge records
-- **Qdrant** for vector search
-- **Ollama running on the local host** for chat and embeddings
-- Secret redaction before indexing
-- Read-only safety boundary: no shell execution, file modification, deletion, installation, or autonomous remediation
-
-There is **no SQLite database** and **no Ollama container**.
-
-## Architecture
+## V0.1 architecture
 
 ```text
-Browser
-   |
-   v
 FastAPI
-   |
-   +---- PostgreSQL (metadata / source records)
-   |
-   +---- Redaction -> Chunking -> Embeddings -> Qdrant
-   |                                      |
-   +---- RAG context --------------------+
-   |                                      |
-   +------------------------------------> Ollama (host)
-                                          |
-                                          v
-                                        Answer
+  ↓
+Notes / Events
+  ↓
+Secret Redaction
+  ↓
+PostgreSQL
+  ↓
+RAG
+  ↓
+Qdrant
+  ↓
+Ollama
+  ↓
+Ask My Work UI
 ```
 
-Docker Compose runs only the Ask My Work API, PostgreSQL, and Qdrant. Ollama is expected to already be running on the host at `11434`.
+### Data responsibilities
+
+- **PostgreSQL** — durable application metadata and redacted knowledge records.
+- **Qdrant** — semantic vector index used by RAG retrieval.
+- **Ollama** — local chat and embedding models, already running on the host.
+- **FastAPI** — ingestion, retrieval, RAG orchestration, and UI API.
+
+There is no SQLite database and no Ollama container.
+
+## Repository structure
+
+```text
+ask-my-work/
+├── app/
+│   ├── main.py
+│   ├── config.py
+│   ├── db.py
+│   └── services/
+│       ├── redaction.py
+│       ├── text.py
+│       └── qdrant_store.py
+│
+├── ui/
+│   └── index.html
+│
+├── docs/
+│   ├── architecture.md
+│   └── security.md
+│
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+├── .env.example
+├── .gitignore
+└── README.md
+```
+
+## Runtime
+
+Docker Compose runs only:
+
+```text
+ask-my-work-api       :8000
+ask-my-work-postgres  :5432
+ask-my-work-qdrant    :6333
+```
+
+Ollama is host-managed:
+
+```text
+http://127.0.0.1:11434
+```
+
+From the API container it is reached through `host.docker.internal`.
 
 ## Quick start
 
 ```bash
 cp .env.example .env
-# Set a strong POSTGRES_PASSWORD in .env
+# Set POSTGRES_PASSWORD in .env
 docker compose up -d --build
-curl http://127.0.0.1:8000/health
-```
 
-Make sure Ollama is running on the host and the required models exist:
-
-```bash
 ollama list
 ollama pull qwen3:4b
 ollama pull nomic-embed-text
+
+curl http://127.0.0.1:8000/health
 ```
 
 Open `http://127.0.0.1:8000`.
-
-## Services
-
-| Service | Purpose | Port |
-|---|---|---:|
-| API | Application/API/UI | 8000 |
-| PostgreSQL | Metadata and knowledge records | 5432 |
-| Qdrant | Vector database | 6333 |
-| Ollama | Local LLM + embeddings; host-managed | 11434 |
 
 ## Test
 
@@ -71,8 +99,8 @@ Open `http://127.0.0.1:8000`.
 docker compose run --rm api pytest -q
 ```
 
-## Safety model
+## Safety
 
-Phase 0/1 is deliberately read-only. The LLM cannot execute commands or directly modify the host. Any future action capability must go through an explicit policy engine and human approval.
+V0.1 is read-only. The model cannot execute shell commands, modify host files, install software, delete data, or autonomously remediate infrastructure.
 
 See `docs/architecture.md` and `docs/security.md`.
